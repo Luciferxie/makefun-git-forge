@@ -237,8 +237,23 @@ export function walkCommits(
 /** True when `ancestor` is `descendant` itself or reachable from it through parents. */
 export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  for (const commit of walkCommits(repo, [descendant])) {
-    if (commit.oid === ancestor) return true;
+  // Stop at the first match. walkCommits builds the whole ancestry before the caller can look
+  // at the first entry, so using it here made every push walk the entire history so far: the
+  // 200-push workload became quadratic (and a long-lived repository worse). A push's usual
+  // case is one step (old tip is the new commit's parent), which this returns on immediately.
+  const seen = new Set<string>([descendant]);
+  const stack: string[] = [descendant];
+  while (stack.length > 0) {
+    const oid = stack.pop() as string;
+    const obj = repo.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') continue;
+    for (const parent of parseCommit(obj.data).parents) {
+      if (parent === ancestor) return true;
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        stack.push(parent);
+      }
+    }
   }
   return false;
 }

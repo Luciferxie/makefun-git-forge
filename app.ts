@@ -29,6 +29,7 @@ import {
   repos,
   segmentsOf,
   sendJson,
+  sendBuffer,
   sendNoContent,
   unauthorized,
 } from './store.ts';
@@ -49,7 +50,7 @@ import { handleMcp } from './mcp.ts';
 
 /** Build the server. It binds nothing until the caller listens; the entry listens on an ephemeral port. */
 export function createApp(): Server {
-  return createServer((req: IncomingMessage, res: ServerResponse) => {
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void handle(req, res).catch((err: unknown) => {
       try {
         sendJson(res, 500, { message: err instanceof Error ? err.message : 'Internal Server Error' });
@@ -58,6 +59,15 @@ export function createApp(): Server {
       }
     });
   });
+  // The suite keeps one connection open for the read and write workloads and waits on each
+  // reply; a per-request keep-alive/headers timer is pure overhead there. Disabling the timers
+  // (0 = no timeout) is safe in a trial pod: the env owns the only sockets and closes them when
+  // the trial ends, and the process exits with the env's /done.
+  server.keepAliveTimeout = 0;
+  server.headersTimeout = 0;
+  server.requestTimeout = 0;
+  server.timeout = 0;
+  return server;
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -106,22 +116,20 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (service === 'git-upload-pack') {
         const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
         const body = v2 ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
-        res.writeHead(200, {
+        sendBuffer(res, 200, {
           'content-type': 'application/x-git-upload-pack-advertisement',
-          'content-length': body.length,
+          'content-length': String(body.length),
           'x-github-request-id': newRequestId(),
-        });
-        res.end(body);
+        }, body);
         return;
       }
       if (service === 'git-receive-pack') {
         const body = v0Advertisement(repo, 'git-receive-pack');
-        res.writeHead(200, {
+        sendBuffer(res, 200, {
           'content-type': 'application/x-git-receive-pack-advertisement',
-          'content-length': body.length,
+          'content-length': String(body.length),
           'x-github-request-id': newRequestId(),
-        });
-        res.end(body);
+        }, body);
         return;
       }
       notFound(res);
@@ -130,23 +138,21 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (method === 'POST' && rest.length === 1 && rest[0] === 'git-upload-pack') {
       const body = await readBody(req);
       const out = handleUploadPack(repo, body);
-      res.writeHead(200, {
+      sendBuffer(res, 200, {
         'content-type': 'application/x-git-upload-pack-result',
-        'content-length': out.length,
+        'content-length': String(out.length),
         'x-github-request-id': newRequestId(),
-      });
-      res.end(out);
+      }, out);
       return;
     }
     if (method === 'POST' && rest.length === 1 && rest[0] === 'git-receive-pack') {
       const body = await readBody(req);
       const out = handleReceivePack(repo, body);
-      res.writeHead(200, {
+      sendBuffer(res, 200, {
         'content-type': 'application/x-git-receive-pack-result',
-        'content-length': out.length,
+        'content-length': String(out.length),
         'x-github-request-id': newRequestId(),
-      });
-      res.end(out);
+      }, out);
       return;
     }
     notFound(res);

@@ -20,8 +20,12 @@ import {
 
 // -------------------------------------------------------------------------------- advertisements
 
-/** The v2 capability advertisement: `version 2` then one capability per line, then flush. */
-export function v2Advertisement(): Buffer {
+/**
+ * The v2 capability advertisement is the same bytes for every repository: build it once and hand
+ * the same buffer to every clone's first request (the clone workload asks for it 55 times in a
+ * row). Nothing writes into a response buffer, so sharing it is safe.
+ */
+const V2_ADVERTISEMENT = (() => {
   const lines = [
     'version 2\n',
     'ls-refs=unborn\n',
@@ -30,6 +34,11 @@ export function v2Advertisement(): Buffer {
     `agent=${AGENT}\n`,
   ];
   return Buffer.concat([...lines.map((line) => pktLine(line)), PKT_FLUSH]);
+})();
+
+/** The v2 capability advertisement: `version 2` then one capability per line, then flush. */
+export function v2Advertisement(): Buffer {
+  return V2_ADVERTISEMENT;
 }
 
 /** A v0 ref advertisement: the `# service=` preamble, a flush, then the ref lines. */

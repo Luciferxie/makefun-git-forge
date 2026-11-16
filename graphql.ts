@@ -564,6 +564,8 @@ function resolveField(exec: Executor, type: string, value: TypedValue | null, fi
       const issue = subject.repo.issues.find((entry) => entry.number === subject.number);
       if (issue === undefined) return fail('closeIssue: unknown issueId.');
       issue.state = 'closed';
+      // The REST read cache keys on rev: a closed issue must not serve its open-state bytes.
+      issue.rev = (issue.rev ?? 0) + 1;
       return { __typename: 'CloseIssuePayload', issue: issueValue(subject.repo, issue) };
     }
     if (field.name === 'createPullRequest') {
@@ -593,7 +595,10 @@ function resolveField(exec: Executor, type: string, value: TypedValue | null, fi
       const commentId = subject.repo.id * 1000000 + 800000 + subject.repo.nextCommentId++;
       if (subject.kind === 'issue') {
         const issue = subject.repo.issues.find((entry) => entry.number === subject.number);
-        if (issue !== undefined) issue.comments.push({ id: commentId, body });
+        if (issue !== undefined) {
+          issue.comments.push({ id: commentId, body });
+          issue.rev = (issue.rev ?? 0) + 1;
+        }
       }
       return {
         __typename: 'AddCommentPayload',

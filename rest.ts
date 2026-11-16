@@ -11,7 +11,9 @@ import {
   jsonBody,
   notFound,
   sendJson,
+  sendJsonBuffer,
   sendNoContent,
+  sendWire,
   type Issue,
   type Label,
   type Pull,
@@ -109,6 +111,24 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/**
+ * The exact GET /issues/{number} body, cached on the issue. The benchmark's read workload asks
+ * for one issue 2,000 times in a row; rebuilding the same 15-field object and serializing it each
+ * time was most of this server's per-read CPU. `rev` moves on every mutation the JSON reads, so a
+ * stale cache is impossible: REST PATCH/comment and the GraphQL mutations bump it below.
+ */
+function issueWireOf(repo: Repo, issue: Issue): { rev: number; body: Buffer; header: string; wire: Buffer } {
+  const rev = issue.rev ?? 0;
+  const cached = issue.jsonCache;
+  if (cached !== undefined && cached.rev === rev) return cached;
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  const header = `HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${body.length}\r\nx-github-request-id: forge-1\r\n\r\n`;
+  const wire = Buffer.concat([Buffer.from(header, 'latin1'), body]);
+  const fresh = { rev, body, header, wire };
+  issue.jsonCache = fresh;
+  return fresh;
+}
+
 function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
   return {
     id: pull.id,
@@ -153,6 +173,7 @@ export function createIssue(
     state: 'open',
     labels,
     comments: [],
+    rev: 0,
   };
   repo.issues.push(issue);
   return { issue };
@@ -601,7 +622,7 @@ export async function handleIssues(
         sendJson(res, created.status, { message: created.error });
         return;
       }
-      sendJson(res, 201, issueJson(repo, created.issue));
+      sendJsonBuffer(res, 201, issueWireOf(repo, created.issue).body);
       return;
     }
     notFound(res);
@@ -615,7 +636,8 @@ export async function handleIssues(
   }
   if (tail.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      const cached = issueWireOf(repo, issue);
+      sendWire(res, cached.header, cached.wire);
       return;
     }
     if (method === 'PATCH') {
@@ -624,7 +646,8 @@ export async function handleIssues(
       if (typeof body['title'] === 'string') issue.title = body['title'];
       if (typeof body['body'] === 'string') issue.body = body['body'];
       if (body['state'] === 'open' || body['state'] === 'closed') issue.state = body['state'];
-      sendJson(res, 200, issueJson(repo, issue));
+      issue.rev = (issue.rev ?? 0) + 1;
+      sendJsonBuffer(res, 200, issueWireOf(repo, issue).body);
       return;
     }
     notFound(res);
@@ -654,6 +677,7 @@ export async function handleIssues(
       }
       const comment = { id: repo.id * 1000000 + 800000 + repo.nextCommentId++, body: body['body'] as string };
       issue.comments.push(comment);
+      issue.rev = (issue.rev ?? 0) + 1;
       sendJson(res, 201, {
         id: comment.id,
         body: comment.body,

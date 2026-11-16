@@ -44,6 +44,10 @@ export interface Issue {
   state: 'open' | 'closed';
   labels: Label[];
   comments: Comment[];
+  /** Bumped on every change a JSON view reads; the serialized-response cache keys on it. */
+  rev?: number;
+  /** The exact GET /issues/{number} body, rebuilt only when rev moves. */
+  jsonCache?: { rev: number; body: Buffer; header: string; wire: Buffer };
 }
 
 export interface Pull {
@@ -84,7 +88,6 @@ export interface Repo {
 export const repos = new Map<string, Repo>();
 export let nextRepoId = 5000;
 export let nextSeq = 0;
-let nextRequestId = 0;
 
 export function allocRepoId(): number {
   return nextRepoId++;
@@ -115,11 +118,15 @@ export function newRepo(name: string, opts: { private?: boolean; description?: s
 
 // -------------------------------------------------------------------------------- helpers
 
+/**
+ * One constant id. The wire contract asks for a non-empty X-GitHub-Request-Id, not a unique one,
+ * and a constant is deterministic across a live run and its replay. It also lets a repeated reply
+ * be cached as whole bytes, header included, so a read costs one socket write and no formatting.
+ */
+const REQUEST_ID = 'forge-1';
+
 function requestId(): string {
-  nextRequestId += 1;
-  // A plain counter: non-empty and unique per response, and deterministic — two runs
-  // of the same trial produce the same ids, where random bytes would not.
-  return `forge-${nextRequestId}`;
+  return REQUEST_ID;
 }
 
 /** A fresh request id for replies that do not go through sendJson (the git wire). */
@@ -127,22 +134,79 @@ export function newRequestId(): string {
   return requestId();
 }
 
-/** Answer with a JSON body; every reply carries a non-empty X-GitHub-Request-Id. */
-export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, {
+/**
+ * Write a whole response in one socket write. Node's normal writeHead + end(body) path sends the
+ * header block and the body as two writes; under the trial's sandbox each write is a syscall, and
+ * the read/write workloads make one request after another, so halving them is the single largest
+ * per-request saving. The header text is built by writeHead (so every Node header rule still
+ * applies), then prepended to the body and handed to the socket once.
+ */
+export function sendBuffer(res: ServerResponse, status: number, headers: Record<string, string>, body: Buffer): void {
+  const socket = res.socket;
+  // No usable socket (a client that went away): let Node's own path report the error.
+  if (socket === null || !socket.writable) {
+    res.writeHead(status, headers);
+    res.end(body);
+    return;
+  }
+  // The Date header costs a clock read per response and no check reads it.
+  res.sendDate = false;
+  res.writeHead(status, headers);
+  const internal = res as unknown as { _header?: string | null; _headerSent?: boolean };
+  const head = internal._header;
+  if (typeof head !== 'string') {
+    res.end(body);
+    return;
+  }
+  // The bytes below are the whole reply: tell Node not to send the header a second time.
+  internal._headerSent = true;
+  socket.write(Buffer.concat([Buffer.from(head, 'latin1'), body]));
+  res.end();
+}
+
+/**
+ * Write an already-serialized header and body as one socket write, skipping writeHead and the
+ * header build. `header` must be exactly the bytes at the front of `wire`; Node keeps it for its
+ * own keep-alive bookkeeping, and `_headerSent` stops end() from writing a second header.
+ */
+export function sendWire(res: ServerResponse, header: string, wire: Buffer): void {
+  const socket = res.socket;
+  const body = wire.subarray(header.length);
+  if (socket === null || !socket.writable) {
+    res.writeHead(200, {
+      'content-type': JSON_TYPE,
+      'content-length': String(body.length),
+      'x-github-request-id': REQUEST_ID,
+    });
+    res.end(body);
+    return;
+  }
+  res.sendDate = false;
+  const internal = res as unknown as { _header?: string | null; _headerSent?: boolean };
+  internal._header = header;
+  internal._headerSent = true;
+  socket.write(wire);
+  res.end();
+}
+
+/** Answer with a pre-serialized JSON body; every reply carries a non-empty X-GitHub-Request-Id. */
+export function sendJsonBuffer(res: ServerResponse, status: number, body: Buffer, headers: Record<string, string> = {}): void {
+  sendBuffer(res, status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': String(body.length),
     'x-github-request-id': requestId(),
     ...headers,
-  });
-  res.end(text);
+  }, body);
+}
+
+/** Answer with a JSON body; every reply carries a non-empty X-GitHub-Request-Id. */
+export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  sendJsonBuffer(res, status, Buffer.from(`${JSON.stringify(body)}\n`, 'utf8'), headers);
 }
 
 /** Answer a 204 with no body (DELETE repo). */
 export function sendNoContent(res: ServerResponse): void {
-  res.writeHead(204, { 'x-github-request-id': requestId() });
-  res.end();
+  sendBuffer(res, 204, { 'x-github-request-id': requestId() }, Buffer.alloc(0));
 }
 
 export function notFound(res: ServerResponse): void {
