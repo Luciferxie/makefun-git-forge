@@ -8,6 +8,7 @@ import {
   FIXED_TIME,
   VIEWER_LOGIN,
   VIEWER_ID,
+  cacheGetWire,
   jsonBody,
   notFound,
   sendJson,
@@ -117,16 +118,24 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
  * time was most of this server's per-read CPU. `rev` moves on every mutation the JSON reads, so a
  * stale cache is impossible: REST PATCH/comment and the GraphQL mutations bump it below.
  */
-function issueWireOf(repo: Repo, issue: Issue): { rev: number; body: Buffer; header: string; wire: Buffer } {
+function issueBodyOf(repo: Repo, issue: Issue): Buffer {
   const rev = issue.rev ?? 0;
   const cached = issue.jsonCache;
-  if (cached !== undefined && cached.rev === rev) return cached;
+  if (cached !== undefined && cached.rev === rev) return cached.body;
   const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issue.jsonCache = { rev, body };
+  return body;
+}
+
+/** The GET reply for one issue: body + header + wire, built the first time and cached by rev. */
+function issueWireOf(repo: Repo, issue: Issue): { header: string; wire: Buffer } {
+  const body = issueBodyOf(repo, issue);
+  const entry = issue.jsonCache as { rev: number; body: Buffer; wire?: { header: string; wire: Buffer } };
+  if (entry.wire !== undefined) return entry.wire;
   const header = `HTTP/1.1 200 OK\r\ncontent-type: application/json; charset=utf-8\r\ncontent-length: ${body.length}\r\nx-github-request-id: forge-1\r\n\r\n`;
-  const wire = Buffer.concat([Buffer.from(header, 'latin1'), body]);
-  const fresh = { rev, body, header, wire };
-  issue.jsonCache = fresh;
-  return fresh;
+  const wire = { header, wire: Buffer.concat([Buffer.from(header, 'latin1'), body]) };
+  entry.wire = wire;
+  return wire;
 }
 
 function pullJson(repo: Repo, pull: Pull): Record<string, unknown> {
@@ -622,7 +631,7 @@ export async function handleIssues(
         sendJson(res, created.status, { message: created.error });
         return;
       }
-      sendJsonBuffer(res, 201, issueWireOf(repo, created.issue).body);
+      sendJsonBuffer(res, 201, issueBodyOf(repo, created.issue));
       return;
     }
     notFound(res);
@@ -637,6 +646,8 @@ export async function handleIssues(
   if (tail.length === 1) {
     if (method === 'GET') {
       const cached = issueWireOf(repo, issue);
+      const url = req.url;
+      if (url !== undefined && url.indexOf('?') < 0) cacheGetWire(url, cached.header, cached.wire);
       sendWire(res, cached.header, cached.wire);
       return;
     }
@@ -647,7 +658,7 @@ export async function handleIssues(
       if (typeof body['body'] === 'string') issue.body = body['body'];
       if (body['state'] === 'open' || body['state'] === 'closed') issue.state = body['state'];
       issue.rev = (issue.rev ?? 0) + 1;
-      sendJsonBuffer(res, 200, issueWireOf(repo, issue).body);
+      sendJsonBuffer(res, 200, issueBodyOf(repo, issue));
       return;
     }
     notFound(res);

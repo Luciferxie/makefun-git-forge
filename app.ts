@@ -20,8 +20,8 @@ import {
   VIEWER_LOGIN,
   authorized,
   jsonBody,
+  getWireCache,
   newRepo,
-  newRequestId,
   notFound,
   queryOf,
   readBody,
@@ -29,7 +29,8 @@ import {
   repos,
   segmentsOf,
   sendJson,
-  sendBuffer,
+  sendTyped,
+  sendWire,
   sendNoContent,
   unauthorized,
 } from './store.ts';
@@ -72,6 +73,23 @@ export function createApp(): Server {
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
+
+  // The read workload asks for one issue URL 2,000 times: answer a repeated GET from the whole
+  // reply cache before parsing the URL or touching the store. Any non-GET request clears it
+  // (a write can change anything), and an unauthenticated GET never reads it.
+  if (method === 'GET') {
+    const url = req.url;
+    if (url !== undefined && url.indexOf('?') < 0 && authorized(req)) {
+      const hit = getWireCache.get(url);
+      if (hit !== undefined) {
+        sendWire(res, hit.header, hit.wire);
+        return;
+      }
+    }
+  } else {
+    getWireCache.clear();
+  }
+
   const segments = segmentsOf(req);
 
   // The env's boot probe: 200 {"ok":true}, no auth.
@@ -116,20 +134,12 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
       if (service === 'git-upload-pack') {
         const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
         const body = v2 ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
-        sendBuffer(res, 200, {
-          'content-type': 'application/x-git-upload-pack-advertisement',
-          'content-length': String(body.length),
-          'x-github-request-id': newRequestId(),
-        }, body);
+        sendTyped(res, 200, 'application/x-git-upload-pack-advertisement', body);
         return;
       }
       if (service === 'git-receive-pack') {
         const body = v0Advertisement(repo, 'git-receive-pack');
-        sendBuffer(res, 200, {
-          'content-type': 'application/x-git-receive-pack-advertisement',
-          'content-length': String(body.length),
-          'x-github-request-id': newRequestId(),
-        }, body);
+        sendTyped(res, 200, 'application/x-git-receive-pack-advertisement', body);
         return;
       }
       notFound(res);
@@ -138,21 +148,13 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
     if (method === 'POST' && rest.length === 1 && rest[0] === 'git-upload-pack') {
       const body = await readBody(req);
       const out = handleUploadPack(repo, body);
-      sendBuffer(res, 200, {
-        'content-type': 'application/x-git-upload-pack-result',
-        'content-length': String(out.length),
-        'x-github-request-id': newRequestId(),
-      }, out);
+      sendTyped(res, 200, 'application/x-git-upload-pack-result', out);
       return;
     }
     if (method === 'POST' && rest.length === 1 && rest[0] === 'git-receive-pack') {
       const body = await readBody(req);
       const out = handleReceivePack(repo, body);
-      sendBuffer(res, 200, {
-        'content-type': 'application/x-git-receive-pack-result',
-        'content-length': String(out.length),
-        'x-github-request-id': newRequestId(),
-      }, out);
+      sendTyped(res, 200, 'application/x-git-receive-pack-result', out);
       return;
     }
     notFound(res);
